@@ -41,6 +41,11 @@ consul kv put config/product-api/resilience4j.circuitbreaker.instances.currency-
 REM Nao repetir chamadas quando o Circuit Breaker estiver aberto
 consul kv put config/product-api/resilience4j.retry.instances.currency-api.ignore-exceptions[0] "io.github.resilience4j.circuitbreaker.CallNotPermittedException"
 
+REM Erros 4xx do currency-api (ex.: 404 cotacao inexistente) nao sao falhas de disponibilidade:
+REM nao repetir a chamada e nao contar para abrir o Circuit Breaker
+consul kv put config/product-api/resilience4j.retry.instances.currency-api.ignore-exceptions[1] "org.springframework.web.client.HttpClientErrorException"
+consul kv put config/product-api/resilience4j.circuitbreaker.instances.currency-api.ignore-exceptions[0] "org.springframework.web.client.HttpClientErrorException"
+
 REM Configuracao do cache utilizando Caffeine
 consul kv put config/product-api/spring.cache.type "caffeine"
 consul kv put config/product-api/spring.cache.cache-names "currency-api"
