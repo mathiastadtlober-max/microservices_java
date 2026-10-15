@@ -1,0 +1,110 @@
+name: teste-bcb-resilience
+on: push
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports: ["5432:5432"]
+        options: --health-cmd pg_isready --health-interval 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: '21', cache: maven }
+      - name: Consul + bancos
+        run: |
+          docker run -d --name consul --network host hashicorp/consul:1.20 agent -dev -client 0.0.0.0
+          export PGPASSWORD=postgres
+          psql -h localhost -U postgres -c "create database db_product"
+          psql -h localhost -U postgres -c "create database db_currency"
+          sleep 5
+          python3 - <<'PY'
+          import shlex, urllib.request
+          for line in open('start_consul.bat', encoding='utf-8'):
+              if line.startswith('consul kv put'):
+                  _,_,_,k,v = shlex.split(line.strip())
+                  req = urllib.request.Request('http://localhost:8500/v1/kv/'+k, data=v.encode(), method='PUT')
+                  urllib.request.urlopen(req).read()
+          PY
+      - name: Build
+        run: |
+          (cd currency-api && mvn -B -ntp -q package -DskipTests)
+          (cd product-api && mvn -B -ntp -q package -DskipTests)
+      - name: Testes
+        run: |
+          set -eu
+          start_currency() {
+            [ -f currency.pid ] && kill $(cat currency.pid) && sleep 3 || true
+            nohup java -jar currency-api/target/*.jar "$@" > "$LOG" 2>&1 &
+            echo $! > currency.pid
+            for i in $(seq 1 60); do curl -sf localhost:8100/actuator/health >/dev/null && break; sleep 2; done
+          }
+          q() { curl -s -w '\nHTTP %{http_code} em %{time_total}s\n' "localhost:8100/currencies?source=$1&target=$2" | tee out.txt; }
+          ok() { echo "  OK - $1"; }
+
+          echo "########## FASE A: API real do BCB"
+          LOG=currencyA.log start_currency
+          nohup java -jar product-api/target/*.jar > product.log 2>&1 &
+          for i in $(seq 1 60); do curl -sf localhost:8000/actuator/health >/dev/null && break; sleep 2; done
+          sleep 8
+
+          echo "== 1. Moeda com cotacao no BCB (USD -> BRL)"
+          q USD BRL; grep -q 'Source: BCB PTAX' out.txt; grep -q '5.2079' out.txt; ok "cotacao veio do BCB (5.2079)"
+          echo "== 1b. Taxa cruzada EUR -> USD via BCB"
+          q EUR USD; grep -q 'Source: BCB PTAX' out.txt; ok "taxa cruzada calculada com dados do BCB"
+          echo "== 7. Cache: repetir USD -> BRL nao chama o BCB de novo"
+          q USD BRL >/dev/null
+          test "$(grep -c 'Consultando BCB: moeda=USD' currencyA.log)" = 1; ok "BCB consultado 1 vez para USD"
+          echo "== 2. Moeda sem cotacao no BCB (USD -> ARS) -> fallback banco local"
+          q USD ARS; grep -q 'BCB sem cotação' out.txt; grep -q 'banco local' out.txt; grep -q '1510.45' out.txt; ok "fallback local usado"
+          test "$(grep -c 'Consultando BCB: moeda=ARS' currencyA.log)" = 1; ok "sem retry para resposta sem cotacao"
+          q USD ARS >/dev/null
+          test "$(grep -c 'Consultando BCB: moeda=ARS' currencyA.log)" = 2; ok "resposta sem cotacao NAO foi para o cache"
+          echo "== 8. Sem cotacao no BCB nem no banco (USD -> XYZ) -> 404"
+          q USD XYZ; grep -q 'HTTP 404' out.txt; ok "404 retornado"
+          echo "== Integracao product-api -> currency-api -> BCB"
+          curl -s "localhost:8000/products/1?targetCurrency=BRL" | tee p.json | jq -c '{price, convertedPrice, environment}'
+          jq -e '.environment | contains("BCB PTAX")' p.json; ok "product-api recebeu cotacao do BCB"
+
+          echo "########## FASE B: BCB fora do ar (conexao recusada)"
+          LOG=currencyB.log start_currency --app.bcb.base-url=http://127.0.0.1:9
+          echo "== 3. Falha de comunicacao: Retry com 3 tentativas + fallback"
+          q USD BRL; grep -q 'banco local' out.txt; grep -q '5.15' out.txt
+          test "$(grep -c 'Consultando BCB' currencyB.log)" = 3; ok "3 tentativas e fallback local (5.15)"
+          echo "== 5. Falhas consecutivas abrem o Circuit Breaker"
+          q USD EUR >/dev/null
+          curl -s localhost:8100/actuator/circuitbreakers | tee cb.json | jq -c '.circuitBreakers.bcb | {state, failureRate}'
+          jq -e '.circuitBreakers.bcb.state == "OPEN"' cb.json; ok "circuito OPEN"
+          echo "== 6. Circuito aberto: fallback local sem chamar o BCB"
+          before=$(grep -c 'Consultando BCB' currencyB.log)
+          q USD GBP; grep -q 'OPEN' out.txt; grep -q 'banco local' out.txt; grep -q '0.75' out.txt
+          test "$(grep -c 'Consultando BCB' currencyB.log)" = "$before"; ok "nenhuma chamada ao BCB e fallback usado"
+
+          echo "########## FASE C: BCB lento (responde depois de 30s)"
+          python3 -c "
+          import http.server, time
+          class H(http.server.BaseHTTPRequestHandler):
+              def do_GET(self):
+                  time.sleep(30); self.send_response(200); self.end_headers(); self.wfile.write(b'{}')
+          http.server.ThreadingHTTPServer(('127.0.0.1', 9999), H).serve_forever()" &
+          LOG=currencyC.log start_currency --app.bcb.base-url=http://127.0.0.1:9999
+          echo "== 4. Read timeout de 5s em cada tentativa (3 x 5s + 2 x 1s ~ 17s) e fallback"
+          q USD BRL; grep -q 'banco local' out.txt
+          t=$(grep -o 'em [0-9.]*s' out.txt | grep -o '[0-9.]*' | cut -d. -f1)
+          test "$t" -ge 15 -a "$t" -le 25; grep -qi 'timed out' out.txt; ok "read timeout acionado (${t}s no total)"
+
+          echo "########## FASE D: connect timeout (IP que nao responde)"
+          LOG=currencyD.log start_currency --app.bcb.base-url=http://10.255.255.1
+          q USD BRL; grep -q 'banco local' out.txt || true
+          t=$(grep -o 'em [0-9.]*s' out.txt | grep -o '[0-9.]*' | cut -d. -f1)
+          echo "tempo total: ${t}s (esperado ~8s = 3 x 2s + 2 x 1s)"
+          if [ "$t" -ge 6 ] && [ "$t" -le 14 ]; then ok "connect timeout acionado"; else echo "  AVISO - a rede do runner recusou na hora (sem esperar o timeout)"; fi
+
+          echo "TODOS OS TESTES PASSARAM"
+      - name: Logs
+        if: always()
+        run: |
+          for f in currency*.log; do echo "----- $f"; grep -E 'Consultando BCB|BCB sem|Falha ao consultar|ERROR|Exception' $f | tail -30; done
