@@ -50,6 +50,30 @@ REM Ordem de execucao dos aspectos de resiliencia e cache
 consul kv put config/product-api/resilience4j.retry.retry-aspect-order "100"
 consul kv put config/product-api/resilience4j.circuitbreaker.circuit-breaker-aspect-order "101"
 
+REM ===== currency-api: integracao com a API do Banco Central (BCB) =====
+consul kv put config/currency-api/app.bcb.data-cotacao "10-01-2026"
+
+REM Retry (BCB)
+consul kv put config/currency-api/resilience4j.retry.instances.bcb.max-attempts "3"
+consul kv put config/currency-api/resilience4j.retry.instances.bcb.wait-duration "1s"
+consul kv put config/currency-api/resilience4j.retry.instances.bcb.ignore-exceptions[0] "io.github.resilience4j.circuitbreaker.CallNotPermittedException"
+
+REM Circuit Breaker (BCB)
+consul kv put config/currency-api/resilience4j.circuitbreaker.instances.bcb.sliding-window-type "COUNT_BASED"
+consul kv put config/currency-api/resilience4j.circuitbreaker.instances.bcb.sliding-window-size "5"
+consul kv put config/currency-api/resilience4j.circuitbreaker.instances.bcb.minimum-number-of-calls "5"
+consul kv put config/currency-api/resilience4j.circuitbreaker.instances.bcb.failure-rate-threshold "50"
+consul kv put config/currency-api/resilience4j.circuitbreaker.instances.bcb.wait-duration-in-open-state "100s"
+
+REM Cache Caffeine (BCB)
+consul kv put config/currency-api/spring.cache.type "caffeine"
+consul kv put config/currency-api/spring.cache.cache-names "bcb-cotacoes"
+consul kv put config/currency-api/spring.cache.caffeine.spec "maximumSize=1000,expireAfterWrite=10m"
+
+REM Ordem dos aspectos: Cache (99) -> Retry (100) -> Circuit Breaker (101)
+consul kv put config/currency-api/resilience4j.retry.retry-aspect-order "100"
+consul kv put config/currency-api/resilience4j.circuitbreaker.circuit-breaker-aspect-order "101"
+
 echo.
 echo Consul iniciado e configuracoes carregadas!
 pause
